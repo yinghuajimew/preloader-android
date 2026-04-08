@@ -9,6 +9,9 @@ jobs:
   build-arm64:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,8 +40,14 @@ jobs:
       - name: Build preloader
         run: cmake --build build-arm64 --config Release -j$(nproc)
 
-      - name: Upload libpreloader.so
-        uses: actions/upload-artifact@v4
+      - name: Get short SHA
+        id: vars
+        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: preloader-arm64
-          path: build-arm64/**/*.so
+          tag_name: build-${{ steps.vars.outputs.sha }}
+          name: Build ${{ steps.vars.outputs.sha }}
+          prerelease: true
+          files: build-arm64/**/*.so
