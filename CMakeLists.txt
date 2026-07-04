@@ -5,8 +5,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-file(GLOB_RECURSE PRELOADER_SRC "src/**/*.cpp")
-add_library(preloader SHARED ${PRELOADER_SRC})
+set(PRELOADER_SOURCES
+        src/pl/PreLoader.cpp
+        src/pl/internal/ModManager.cpp
+        src/pl/memory/Hook.cpp
+        src/pl/memory/Patch.cpp
+        src/pl/memory/Signature.cpp
+        src/pl/runtime/InputBridge.cpp
+        src/pl/runtime/JavaRuntime.cpp
+        src/pl/runtime/ModMenuBridge.cpp
+)
+
+add_library(preloader SHARED ${PRELOADER_SOURCES})
 
 target_include_directories(preloader PUBLIC src)
 target_compile_definitions(preloader PRIVATE PRELOADER_EXPORT UNICODE)
@@ -19,7 +29,17 @@ FetchContent_Declare(
         GIT_REPOSITORY https://github.com/nlohmann/json.git
         GIT_TAG v3.11.3
 )
-FetchContent_MakeAvailable(nlohmann_json)
+FetchContent_Declare(
+        boost_pfr
+        GIT_REPOSITORY https://github.com/boostorg/pfr.git
+        GIT_TAG boost-1.88.0
+)
+FetchContent_Declare(
+        magic_enum
+        GIT_REPOSITORY https://github.com/Neargye/magic_enum.git
+        GIT_TAG v0.9.7
+)
+FetchContent_MakeAvailable(nlohmann_json boost_pfr magic_enum)
 
 find_library(log-lib log)
 find_library(android-lib android)
@@ -42,6 +62,8 @@ target_link_libraries(preloader
         ${egl-lib}
         ${gles-lib}
         nlohmann_json::nlohmann_json
+        Boost::pfr
+        magic_enum::magic_enum
 )
 
 install(TARGETS preloader
@@ -51,13 +73,35 @@ install(TARGETS preloader
 
 install(FILES
         src/pl/Gloss.h
-        src/pl/Hook.h
         src/pl/Logger.h
-        src/pl/Mod.h
-        src/pl/Patch.h
-        src/pl/PreloaderInput.h
-        src/pl/Signature.h
         DESTINATION include/pl)
+
+install(FILES
+        src/pl/c/Hook.h
+        src/pl/c/Macro.h
+        src/pl/c/Mod.h
+        src/pl/c/Patch.h
+        src/pl/c/PreloaderInput.h
+        src/pl/c/PreloaderModMenu.h
+        src/pl/c/Signature.h
+        src/pl/c/Types.h
+        DESTINATION include/pl/c)
+
+install(FILES
+        src/pl/cpp/Config.hpp
+        src/pl/cpp/Hook.hpp
+        src/pl/cpp/Mod.hpp
+        src/pl/cpp/Patch.hpp
+        src/pl/cpp/PreloaderInput.hpp
+        src/pl/cpp/Signature.hpp
+        src/pl/cpp/Types.hpp
+        DESTINATION include/pl/cpp)
+
+install(FILES
+        src/pl/cpp/mod/Mod.hpp
+        src/pl/cpp/mod/NativeMod.hpp
+        src/pl/cpp/mod/RegisterHelper.hpp
+        DESTINATION include/pl/cpp/mod)
 
 install(FILES
         src/pl/api/Macro.h

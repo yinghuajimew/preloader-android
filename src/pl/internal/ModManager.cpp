@@ -3,19 +3,24 @@
 #include <algorithm>
 #include <android/log.h>
 #include <cstdint>
+#include <cstdio>
 #include <dlfcn.h>
-#include <fstream>
 #include <mutex>
 #include <optional>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "pl/Logger.h"
+#include "pl/runtime/ModMenuBridge.h"
 
 namespace {
 constexpr const char *kModLoadSymbol = "LeviMod_Load";
+constexpr const char *kLifecycleLoadSymbol = "PLMod_Load";
+constexpr const char *kLifecycleEnableSymbol = "PLMod_Enable";
+constexpr const char *kLifecycleDisableSymbol = "PLMod_Disable";
+constexpr const char *kLifecycleUnloadSymbol = "PLMod_Unload";
 constexpr const char *kManifestFileName = "manifest.json";
 constexpr const char *kPreloadNativeType = "preload-native";
 constexpr int kLoadedModLookupFlags = RTLD_NOLOAD | RTLD_NOW;
@@ -23,7 +28,34 @@ constexpr int kModDlopenFlags = RTLD_NOW | RTLD_GLOBAL;
 
 auto &logger = preloader_logger;
 std::mutex gInitializedModsMutex;
-std::unordered_set<std::string> gInitializedModLibraries;
+
+using PLModLifecycleLoadFunc = bool (*)(JavaVM *vm, const PLModInfo *mod_info);
+using PLModLifecycleFunc = bool (*)();
+
+enum class LoadedModKind {
+  Legacy,
+  Lifecycle,
+  NoEntry,
+};
+
+enum class LoadedModState {
+  Loaded,
+  Enabled,
+  Unloaded,
+};
+
+struct LoadedModEntry {
+  std::string libraryPath;
+  std::string modId;
+  LoadedModKind kind{LoadedModKind::NoEntry};
+  LoadedModState state{LoadedModState::Loaded};
+  PLModLifecycleFunc enable{};
+  PLModLifecycleFunc disable{};
+  PLModLifecycleFunc unload{};
+};
+
+std::unordered_map<std::string, LoadedModEntry> gLoadedModLibraries;
+std::vector<std::string> gLoadedModOrder;
 
 void LogRaw(int priority, const char *format, const char *path,
             const char *detail = nullptr) {
@@ -97,6 +129,31 @@ std::string GetOptionalString(const nlohmann::json &object, const char *key) {
   return object[key].get<std::string>();
 }
 
+std::optional<std::string> ReadTextFile(const std::filesystem::path &path) {
+  FILE *file = std::fopen(path.string().c_str(), "rb");
+  if (!file)
+    return std::nullopt;
+
+  std::string content;
+  char buffer[4096];
+  while (true) {
+    const size_t bytesRead = std::fread(buffer, 1, sizeof(buffer), file);
+    if (bytesRead > 0)
+      content.append(buffer, bytesRead);
+
+    if (bytesRead < sizeof(buffer)) {
+      if (std::ferror(file)) {
+        std::fclose(file);
+        return std::nullopt;
+      }
+      break;
+    }
+  }
+
+  std::fclose(file);
+  return content;
+}
+
 std::optional<ParsedModDirectory>
 ParseModDirectory(const std::filesystem::path &modDirectory) {
   namespace fs = std::filesystem;
@@ -105,13 +162,13 @@ ParseModDirectory(const std::filesystem::path &modDirectory) {
   if (!fs::exists(manifestPath) || !fs::is_regular_file(manifestPath))
     return std::nullopt;
 
-  std::ifstream manifestFile(manifestPath);
-  if (!manifestFile)
+  const auto manifestContent = ReadTextFile(manifestPath);
+  if (!manifestContent.has_value())
     return std::nullopt;
 
   nlohmann::json manifestJson;
   try {
-    manifestFile >> manifestJson;
+    manifestJson = nlohmann::json::parse(*manifestContent);
   } catch (const std::exception &ex) {
     logger.warn("Failed to parse manifest {}: {}", manifestPath.string(),
                 ex.what());
@@ -217,11 +274,15 @@ void FinalizeRuntimeModInfo(RuntimeModInfoStorage &storage) {
   };
 }
 
-bool CreateRuntimeModInfo(const std::filesystem::path &libraryPath,
-                          RuntimeModInfoStorage &storage) {
+bool CreateRuntimeModInfo(
+    const std::filesystem::path &libraryPath,
+    const std::optional<std::filesystem::path> &sourceModDirectory,
+    RuntimeModInfoStorage &storage) {
   namespace fs = std::filesystem;
 
-  const auto modRoot = FindModRootForLibraryPath(libraryPath);
+  const auto modRoot = sourceModDirectory.has_value()
+                           ? sourceModDirectory
+                           : FindModRootForLibraryPath(libraryPath);
   if (!modRoot.has_value()) {
     logger.error("Failed to resolve mod root for library {}",
                  libraryPath.string());
@@ -236,11 +297,6 @@ bool CreateRuntimeModInfo(const std::filesystem::path &libraryPath,
 
   const fs::path expectedLibraryPath =
       (parsedMod->rootPath / parsedMod->entryPath).lexically_normal();
-  const fs::path requestedLibraryPath = libraryPath.lexically_normal();
-  if (expectedLibraryPath != requestedLibraryPath) {
-    logger.warn("Using manifest entry {} instead of requested library {}",
-                expectedLibraryPath.string(), requestedLibraryPath.string());
-  }
 
   if (!fs::exists(expectedLibraryPath) ||
       !fs::is_regular_file(expectedLibraryPath)) {
@@ -263,18 +319,70 @@ bool CreateRuntimeModInfo(const std::filesystem::path &libraryPath,
   return true;
 }
 
-PLModLoadFunc ResolveModEntry(void *handle) {
+PLModLoadFunc ResolveLegacyModEntry(void *handle) {
   return reinterpret_cast<PLModLoadFunc>(dlsym(handle, kModLoadSymbol));
 }
 
-bool IsModAlreadyInitialized(const std::string &normalizedLibraryPath) {
-  std::lock_guard<std::mutex> lock(gInitializedModsMutex);
-  return gInitializedModLibraries.contains(normalizedLibraryPath);
+PLModLifecycleLoadFunc ResolveLifecycleLoad(void *handle) {
+  return reinterpret_cast<PLModLifecycleLoadFunc>(
+      dlsym(handle, kLifecycleLoadSymbol));
 }
 
-void MarkModInitialized(const std::string &normalizedLibraryPath) {
+PLModLifecycleFunc ResolveLifecycleFunc(void *handle, const char *symbol) {
+  return reinterpret_cast<PLModLifecycleFunc>(dlsym(handle, symbol));
+}
+
+bool IsModAlreadyRegistered(const std::string &normalizedLibraryPath) {
   std::lock_guard<std::mutex> lock(gInitializedModsMutex);
-  gInitializedModLibraries.insert(normalizedLibraryPath);
+  const auto it = gLoadedModLibraries.find(normalizedLibraryPath);
+  return it != gLoadedModLibraries.end() &&
+         it->second.state != LoadedModState::Unloaded;
+}
+
+void RegisterLoadedMod(const std::string &normalizedLibraryPath,
+                       LoadedModEntry entry) {
+  std::lock_guard<std::mutex> lock(gInitializedModsMutex);
+  const auto [it, inserted] =
+      gLoadedModLibraries.emplace(normalizedLibraryPath, LoadedModEntry{});
+  it->second = std::move(entry);
+  if (inserted) {
+    gLoadedModOrder.push_back(normalizedLibraryPath);
+  }
+}
+
+std::vector<std::string> GetLoadedModKeysSnapshot() {
+  std::lock_guard<std::mutex> lock(gInitializedModsMutex);
+  std::vector<std::string> keys;
+  keys.reserve(gLoadedModOrder.size());
+  for (const auto &key : gLoadedModOrder) {
+    const auto it = gLoadedModLibraries.find(key);
+    if (it == gLoadedModLibraries.end())
+      continue;
+
+    const auto &entry = it->second;
+    if (entry.kind == LoadedModKind::Lifecycle &&
+        entry.state != LoadedModState::Unloaded) {
+      keys.push_back(key);
+    }
+  }
+  return keys;
+}
+
+std::optional<LoadedModEntry> GetLoadedModEntry(const std::string &key) {
+  std::lock_guard<std::mutex> lock(gInitializedModsMutex);
+  const auto it = gLoadedModLibraries.find(key);
+  if (it == gLoadedModLibraries.end())
+    return std::nullopt;
+
+  return it->second;
+}
+
+void SetLoadedModState(const std::string &key, LoadedModState state) {
+  std::lock_guard<std::mutex> lock(gInitializedModsMutex);
+  const auto it = gLoadedModLibraries.find(key);
+  if (it != gLoadedModLibraries.end()) {
+    it->second.state = state;
+  }
 }
 
 void *AcquireModHandle(const std::string &libraryPath) {
@@ -287,18 +395,19 @@ void *AcquireModHandle(const std::string &libraryPath) {
 
 } // namespace
 
-bool ModManager::LoadModLibrary(const std::filesystem::path &libraryPath,
-                                JavaVM *vm) {
+bool ModManager::LoadModLibrary(
+    const std::filesystem::path &libraryPath,
+    const std::optional<std::filesystem::path> &sourceModDirectory,
+    JavaVM *vm) {
   RuntimeModInfoStorage modInfoStorage;
-  if (!CreateRuntimeModInfo(libraryPath, modInfoStorage))
+  if (!CreateRuntimeModInfo(libraryPath, sourceModDirectory, modInfoStorage))
     return false;
 
-  const std::string libraryPathString = modInfoStorage.libraryPath;
+  const std::string libraryPathString = libraryPath.lexically_normal().string();
   const std::string normalizedLibraryPath =
-      NormalizeLibraryPath(modInfoStorage.libraryPath);
+      NormalizeLibraryPath(libraryPathString);
 
-  if (IsModAlreadyInitialized(normalizedLibraryPath)) {
-
+  if (IsModAlreadyRegistered(normalizedLibraryPath)) {
     return true;
   }
 
@@ -309,11 +418,121 @@ bool ModManager::LoadModLibrary(const std::filesystem::path &libraryPath,
     return false;
   }
 
-  if (auto load = ResolveModEntry(handle)) {
-    load(vm, &modInfoStorage.info);
+  LoadedModEntry entry{
+      .libraryPath = normalizedLibraryPath,
+      .modId = modInfoStorage.modId,
+      .kind = LoadedModKind::NoEntry,
+      .state = LoadedModState::Loaded,
+  };
+
+  if (auto load = ResolveLifecycleLoad(handle)) {
+    entry.kind = LoadedModKind::Lifecycle;
+    entry.enable = ResolveLifecycleFunc(handle, kLifecycleEnableSymbol);
+    entry.disable = ResolveLifecycleFunc(handle, kLifecycleDisableSymbol);
+    entry.unload = ResolveLifecycleFunc(handle, kLifecycleUnloadSymbol);
+
+    bool loaded = false;
+    {
+      pl::runtime::ScopedModMenuOwner owner(modInfoStorage.modId);
+      loaded = load(vm, &modInfoStorage.info);
+    }
+    if (!loaded) {
+      logger.error("Failed to run PLMod_Load for {}", modInfoStorage.modId);
+      return false;
+    }
+  } else if (auto legacyLoad = ResolveLegacyModEntry(handle)) {
+    entry.kind = LoadedModKind::Legacy;
+    legacyLoad(vm, &modInfoStorage.info);
+  } else {
+    logger.warn("Mod library {} does not export a lifecycle entry",
+                libraryPathString);
   }
 
-  MarkModInitialized(normalizedLibraryPath);
+  RegisterLoadedMod(normalizedLibraryPath, std::move(entry));
 
   return true;
+}
+
+void ModManager::EnableLoadedMods() {
+  const auto keys = GetLoadedModKeysSnapshot();
+  for (const auto &key : keys) {
+    const auto entry = GetLoadedModEntry(key);
+    if (!entry.has_value() || entry->kind != LoadedModKind::Lifecycle ||
+        entry->state != LoadedModState::Loaded) {
+      continue;
+    }
+
+    if (!entry->enable) {
+      logger.warn("Lifecycle mod {} does not export {}", entry->modId,
+                  kLifecycleEnableSymbol);
+      continue;
+    }
+
+    bool enabled = false;
+    {
+      pl::runtime::ScopedModMenuOwner owner(entry->modId);
+      enabled = entry->enable();
+    }
+    if (!enabled) {
+      logger.error("Failed to enable lifecycle mod {}", entry->modId);
+      continue;
+    }
+
+    SetLoadedModState(key, LoadedModState::Enabled);
+  }
+}
+
+void ModManager::DisableAndUnloadLoadedMods() {
+  auto keys = GetLoadedModKeysSnapshot();
+  std::reverse(keys.begin(), keys.end());
+
+  for (const auto &key : keys) {
+    auto entry = GetLoadedModEntry(key);
+    if (!entry.has_value() || entry->kind != LoadedModKind::Lifecycle ||
+        entry->state == LoadedModState::Unloaded) {
+      continue;
+    }
+
+    if (entry->state == LoadedModState::Enabled) {
+      bool disabled = true;
+      if (entry->disable) {
+        {
+          pl::runtime::ScopedModMenuOwner owner(entry->modId);
+          disabled = entry->disable();
+        }
+        if (!disabled) {
+          disabled = false;
+          logger.error("Failed to disable lifecycle mod {}", entry->modId);
+        }
+      } else {
+        logger.warn("Lifecycle mod {} does not export {}", entry->modId,
+                    kLifecycleDisableSymbol);
+      }
+      if (disabled) {
+        SetLoadedModState(key, LoadedModState::Loaded);
+      }
+    }
+
+    entry = GetLoadedModEntry(key);
+    if (!entry.has_value() || entry->state == LoadedModState::Unloaded) {
+      continue;
+    }
+
+    if (entry->unload) {
+      bool unloaded = false;
+      {
+        pl::runtime::ScopedModMenuOwner owner(entry->modId);
+        unloaded = entry->unload();
+      }
+      if (!unloaded) {
+        logger.error("Failed to unload lifecycle mod {}", entry->modId);
+        continue;
+      }
+    } else {
+      logger.warn("Lifecycle mod {} does not export {}", entry->modId,
+                  kLifecycleUnloadSymbol);
+    }
+    SetLoadedModState(key, LoadedModState::Unloaded);
+    pl::runtime::UnregisterModulesForModId(entry->modId);
+  }
 }
